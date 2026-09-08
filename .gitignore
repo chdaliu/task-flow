@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+
+# Documentation build
+.docc-build/
+docs/build/
+
+# Testing
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
