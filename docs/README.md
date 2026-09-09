@@ -165,13 +165,26 @@ You can also cancel or clear tasks by their registered `id` without holding a
 reference. These static methods default to the process-wide `mainPool`:
 
 ```swift
-TaskFlow.cancel(ids: ["A", "B"])                 // cancel tasks "A" and "B" on mainPool
-TaskFlow.cancel(ids: ["A"], on: pool, clear: true) // cancel and release them on `pool`
-TaskFlow.clear(ids: ["A", "B"])                  // release tasks + dependencies on mainPool
-TaskFlow.clear(ids: ["A"], on: pool, force: true)  // release even if still protected
+TaskFlow.cancel(ids: ["A", "B"])                     // cancel tasks "A" and "B" on mainPool
+TaskFlow.cancel(ids: ["A"], on: pool, clear: true)   // cancel and release them on `pool`
+TaskFlow.clear(ids: ["A", "B"])                      // release tasks + dependencies on mainPool
+TaskFlow.clear(ids: ["A"], on: pool, force: true)    // release even if still protected
+
+TaskFlow.cancel(id: "A")                            // single-id convenience
+TaskFlow.clear(id: "B", on: pool)                   // single-id convenience
 ```
 
-Unknown ids are ignored.
+Each method is asynchronous and can report completion via a trailing closure:
+
+```swift
+TaskFlow.cancel(ids: ["A"]) {
+    // the batch operation has finished
+}
+```
+
+Unknown ids are ignored. As with the instance API, `cancel` only affects tasks
+that have not yet finished: a task that already completed (`.done`) is left
+untouched.
 
 ### 8. Circular dependencies
 

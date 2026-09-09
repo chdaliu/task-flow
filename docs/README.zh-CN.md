@@ -159,13 +159,24 @@ config.isClearProtected = true    // 完成后 clear() 永不释放
 也可以按已注册的任务 `id` 进行取消或清理，无需持有任务引用。这些静态方法默认使用进程级的 `mainPool`：
 
 ```swift
-TaskFlow.cancel(ids: ["A", "B"])                  // 在 mainPool 上取消任务 "A" 和 "B"
-TaskFlow.cancel(ids: ["A"], on: pool, clear: true) // 在 `pool` 上取消并释放
-TaskFlow.clear(ids: ["A", "B"])                   // 在 mainPool 上释放任务及其依赖
-TaskFlow.clear(ids: ["A"], on: pool, force: true)  // 即使结果仍受保护也强制释放
+TaskFlow.cancel(ids: ["A", "B"])                    // 在 mainPool 上取消任务 "A" 和 "B"
+TaskFlow.cancel(ids: ["A"], on: pool, clear: true)  // 在 `pool` 上取消并释放
+TaskFlow.clear(ids: ["A", "B"])                     // 在 mainPool 上释放任务及其依赖
+TaskFlow.clear(ids: ["A"], on: pool, force: true)   // 即使结果仍受保护也强制释放
+
+TaskFlow.cancel(id: "A")                            // 单 id 便捷方法
+TaskFlow.clear(id: "B", on: pool)                   // 单 id 便捷方法
 ```
 
-未注册的 id 会被忽略。
+这些方法都是异步的，可通过尾随闭包感知完成时机：
+
+```swift
+TaskFlow.cancel(ids: ["A"]) {
+    // 该批量操作已完成
+}
+```
+
+未注册的 id 会被忽略。与实例 API 一致，`cancel` 只对尚未完成的任务生效：已完成（`.done`）的任务不会被取消。
 
 ### 8. 循环依赖
 

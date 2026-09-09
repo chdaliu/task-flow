@@ -176,36 +176,83 @@ extension TaskFlow {
     /// Cancels every task registered with one of the given `ids`.
     ///
     /// Mirrors `cancel(clear:)`: only `.ready`/`.flowing` tasks are transitioned
-    /// to `.canceled` and kept in the pool. Pass `clear: true` to also release
-    /// each task (and its reachable dependency graph) from the pool.
+    /// to `.canceled` and kept in the pool. A task that already reached a terminal
+    /// state — most notably one that completed (`.done`) — is left untouched, so
+    /// canceling it is a no-op. Unknown ids are ignored. Pass `clear: true` to also
+    /// release each task (and its reachable dependency graph) from the pool.
+    ///
+    /// The operation runs asynchronously on the pool; `completion` is invoked once
+    /// it has finished.
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to cancel. Unknown ids are ignored.
     ///   - pool: The pool to act on; defaults to the process-wide `mainPool`.
     ///   - clear: When `true`, also releases the canceled tasks from the pool.
-    public static func cancel(ids: [AnyHashable], on pool: TaskFlowPool? = nil, clear: Bool = false) {
+    ///   - completion: Called when the batch operation has finished.
+    public static func cancel(
+        ids: [AnyHashable],
+        on pool: TaskFlowPool? = nil,
+        clear: Bool = false,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
         let pool = pool ?? mainPool
         let batch = TaskFlowIDBatch(ids: ids)
         Task {
             await pool.cancel(batch, clear: clear)
+            completion?()
         }
+    }
+
+    /// Cancels the task registered with the given `id`.
+    ///
+    /// Convenience for `cancel(ids:on:clear:completion:)` acting on a single id.
+    public static func cancel(
+        id: AnyHashable,
+        on pool: TaskFlowPool? = nil,
+        clear: Bool = false,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        cancel(ids: [id], on: pool, clear: clear, completion: completion)
     }
 
     /// Clears every task registered with one of the given `ids`.
     ///
     /// Mirrors `clear(force:)`: a task is released (and its reachable dependency
     /// graph balanced) only when it is not executing and holds no still-protected
-    /// cached result, unless `force` bypasses that protection.
+    /// cached result, unless `force` bypasses that protection. Unknown ids are
+    /// ignored.
+    ///
+    /// The operation runs asynchronously on the pool; `completion` is invoked once
+    /// it has finished.
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to clear. Unknown ids are ignored.
     ///   - pool: The pool to act on; defaults to the process-wide `mainPool`.
     ///   - force: When `true`, releases tasks even if they are still protected.
-    public static func clear(ids: [AnyHashable], on pool: TaskFlowPool? = nil, force: Bool = false) {
+    ///   - completion: Called when the batch operation has finished.
+    public static func clear(
+        ids: [AnyHashable],
+        on pool: TaskFlowPool? = nil,
+        force: Bool = false,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
         let pool = pool ?? mainPool
         let batch = TaskFlowIDBatch(ids: ids)
         Task {
             await pool.clear(batch, force: force)
+            completion?()
         }
+    }
+
+    /// Clears the task registered with the given `id`.
+    ///
+    /// Convenience for `clear(ids:on:force:completion:)` acting on a single id.
+    public static func clear(
+        id: AnyHashable,
+        on pool: TaskFlowPool? = nil,
+        force: Bool = false,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        clear(ids: [id], on: pool, force: force, completion: completion)
     }
 }

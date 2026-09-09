@@ -861,3 +861,103 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     }
     #expect(a.pool == nil)
 }
+
+@Test func cancelByIDsIsNoOpOnCompletedTask() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    await pool.register(a)
+
+    await pool.cancel(TaskFlowIDBatch(ids: ["A"]))
+
+    var done = false
+    if case .done = a.state {
+        done = true
+    }
+    #expect(done)
+    #expect(a.pool != nil)
+}
+
+@Test func clearByIDsKeepsFlowingTaskRetained() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    a.state = .flowing
+    await pool.register(a)
+    #expect(a.sinkCount == 1)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]))
+
+    #expect(a.sinkCount == 0)
+    #expect(a.pool != nil)
+    #expect(!isCanceled(a))
+}
+
+@Test func clearByIDsForceReleasesProtectedTask() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    a.expiresAfter = 60
+    a.isClearProtected = true
+    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    await pool.register(a)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]))
+    #expect(a.pool != nil)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]), force: true)
+    #expect(a.pool == nil)
+}
+
+@Test func staticCancelBySingleID() async throws {
+    let a = TaskFlow(id: "static-single-cancel") {}
+    await mainPool.register(a)
+
+    TaskFlow.cancel(id: "static-single-cancel")
+
+    let deadline = Date().addingTimeInterval(1)
+    while !isCanceled(a) && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(isCanceled(a))
+
+    await mainPool.clear(TaskFlowIDBatch(ids: ["static-single-cancel"]), force: true)
+}
+
+@Test func staticClearBySingleID() async throws {
+    let a = TaskFlow(id: "static-single-clear") {}
+    await mainPool.register(a)
+
+    TaskFlow.clear(id: "static-single-clear")
+
+    let deadline = Date().addingTimeInterval(1)
+    while a.pool != nil && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(a.pool == nil)
+}
+
+@Test func staticCancelCompletionIsInvoked() async throws {
+    let a = TaskFlow(id: "static-completion-cancel") {}
+    await mainPool.register(a)
+
+    let finished = await withCheckedContinuation { continuation in
+        TaskFlow.cancel(ids: ["static-completion-cancel"]) {
+            continuation.resume()
+        }
+    }
+    _ = finished
+    #expect(isCanceled(a))
+
+    await mainPool.clear(TaskFlowIDBatch(ids: ["static-completion-cancel"]), force: true)
+}
+
+@Test func staticClearCompletionIsInvoked() async throws {
+    let a = TaskFlow(id: "static-completion-clear") {}
+    await mainPool.register(a)
+
+    await withCheckedContinuation { continuation in
+        TaskFlow.clear(ids: ["static-completion-clear"]) {
+            continuation.resume()
+        }
+    }
+    #expect(a.pool == nil)
+}

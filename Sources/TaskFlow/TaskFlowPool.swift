@@ -54,7 +54,8 @@ fileprivate final class TaskFlowCompletionBox: @unchecked Sendable {
 /// Task ids are `AnyHashable` and therefore not `Sendable`. The pool serializes
 /// every access to the ids it stores, so like `TaskFlow` itself this box may be
 /// `@unchecked Sendable`; it is only ever created, handed to the pool, and read
-/// on the pool actor.
+/// on the pool actor. It is an internal transport type — it never appears in the
+/// public API surface.
 struct TaskFlowIDBatch: @unchecked Sendable {
     let ids: [AnyHashable]
 }
