@@ -156,6 +156,17 @@ config.expiresAfter = 60          // 缓存 1 分钟
 config.isClearProtected = true    // 完成后 clear() 永不释放
 ```
 
+也可以按已注册的任务 `id` 进行取消或清理，无需持有任务引用。这些静态方法默认使用进程级的 `mainPool`：
+
+```swift
+TaskFlow.cancel(ids: ["A", "B"])                  // 在 mainPool 上取消任务 "A" 和 "B"
+TaskFlow.cancel(ids: ["A"], on: pool, clear: true) // 在 `pool` 上取消并释放
+TaskFlow.clear(ids: ["A", "B"])                   // 在 mainPool 上释放任务及其依赖
+TaskFlow.clear(ids: ["A"], on: pool, force: true)  // 即使结果仍受保护也强制释放
+```
+
+未注册的 id 会被忽略。
+
 ### 8. 循环依赖
 
 环会在执行开始前被检测到，并携带循环路径抛出：

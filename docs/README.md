@@ -161,6 +161,18 @@ config.expiresAfter = 60          // cached for 1 minute
 config.isClearProtected = true    // never released on clear() once done
 ```
 
+You can also cancel or clear tasks by their registered `id` without holding a
+reference. These static methods default to the process-wide `mainPool`:
+
+```swift
+TaskFlow.cancel(ids: ["A", "B"])                 // cancel tasks "A" and "B" on mainPool
+TaskFlow.cancel(ids: ["A"], on: pool, clear: true) // cancel and release them on `pool`
+TaskFlow.clear(ids: ["A", "B"])                  // release tasks + dependencies on mainPool
+TaskFlow.clear(ids: ["A"], on: pool, force: true)  // release even if still protected
+```
+
+Unknown ids are ignored.
+
 ### 8. Circular dependencies
 
 Cycles are detected before execution starts and reported with the cycle trace:
