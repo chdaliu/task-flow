@@ -46,7 +46,7 @@ pod 'TaskFlow'
 
 然后运行 `pod install`。
 
-包源码位于 [`TaskFlow/`](TaskFlow/) 目录（同级的 iOS / macOS 示例工程在仓库根目录下）。
+包源码位于 [`Sources/TaskFlow/`](../Sources/TaskFlow/) 目录。
 
 ## 使用示例
 
@@ -177,4 +177,4 @@ do {
 
 ## 许可证
 
-TaskFlow 基于 [MIT 许可证](LICENSE) 开源。
+TaskFlow 基于 [MIT 许可证](../LICENSE) 开源。

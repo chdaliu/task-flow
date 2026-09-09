@@ -46,7 +46,7 @@ pod 'TaskFlow'
 
 Then run `pod install`.
 
-The package source lives in the [`TaskFlow/`](TaskFlow/) directory (with iOS and macOS examples alongside).
+The package source lives in the [`Sources/TaskFlow/`](../Sources/TaskFlow/) directory.
 
 ## Usage
 
@@ -182,4 +182,4 @@ do {
 
 ## License
 
-TaskFlow is released under the [MIT license](LICENSE).
+TaskFlow is released under the [MIT license](../LICENSE).
