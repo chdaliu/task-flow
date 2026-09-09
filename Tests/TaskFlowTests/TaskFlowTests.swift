@@ -728,3 +728,136 @@ fileprivate enum TestError: Error {
     }
     #expect(bDone)
 }
+
+// MARK: - Static cancel/clear by id
+
+func isCanceled(_ task: TaskFlow) -> Bool {
+    if case .canceled = task.state {
+        return true
+    }
+    return false
+}
+
+@Test func cancelByIDsMarksTasksCanceled() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    let b = TaskFlow(id: "B") {}
+    await pool.register(a)
+    await pool.register(b)
+
+    await pool.cancel(TaskFlowIDBatch(ids: ["A", "B"]))
+
+    #expect(isCanceled(a))
+    #expect(isCanceled(b))
+    #expect(a.pool != nil)
+    #expect(b.pool != nil)
+}
+
+@Test func cancelByIDsKeepsUnmatchedTasks() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    let b = TaskFlow(id: "B") {}
+    await pool.register(a)
+    await pool.register(b)
+
+    await pool.cancel(TaskFlowIDBatch(ids: ["A"]))
+
+    #expect(isCanceled(a))
+    #expect(!isCanceled(b))
+}
+
+@Test func cancelByIDsIgnoresUnknownIDs() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    await pool.register(a)
+
+    await pool.cancel(TaskFlowIDBatch(ids: ["NOPE"]))
+
+    #expect(!isCanceled(a))
+}
+
+@Test func cancelByIDsWithClearReleasesDependencies() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") {}
+    let a = TaskFlow(id: "A", dependencies: [d]) {}
+    try await pool.flow(a)
+    #expect(d.sinkCount == 1)
+
+    await pool.cancel(TaskFlowIDBatch(ids: ["A"]), clear: true)
+
+    #expect(a.pool == nil)
+    #expect(d.pool == nil)
+}
+
+@Test func clearByIDsReleasesTasks() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    await pool.register(a)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]))
+
+    #expect(a.sinkCount == 0)
+    #expect(a.pool == nil)
+}
+
+@Test func clearByIDsBalancesSharedDependencyOnce() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") {}
+    let a1 = TaskFlow(id: "A1", dependencies: [d]) {}
+    let a2 = TaskFlow(id: "A2", dependencies: [d]) {}
+    try await pool.flow(a1)
+    try await pool.flow(a2)
+    #expect(d.sinkCount == 2)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A1", "A2"]))
+
+    #expect(a1.sinkCount == 0)
+    #expect(a2.sinkCount == 0)
+    #expect(d.sinkCount == 0)
+    #expect(d.pool == nil)
+}
+
+@Test func clearByIDsRespectsProtectionUntilForce() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    a.expiresAfter = 60
+    a.isClearProtected = true
+    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    await pool.register(a)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]))
+    #expect(a.sinkCount == 0)
+    #expect(a.pool != nil)
+
+    await pool.clear(TaskFlowIDBatch(ids: ["A"]), force: true)
+    #expect(a.pool == nil)
+}
+
+@Test func staticCancelDefaultsToMainPool() async throws {
+    let a = TaskFlow(id: "static-cancel") {}
+    await mainPool.register(a)
+
+    TaskFlow.cancel(ids: ["static-cancel"])
+
+    let deadline = Date().addingTimeInterval(1)
+    while !isCanceled(a) && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(isCanceled(a))
+    #expect(a.pool != nil)
+
+    await mainPool.clear(TaskFlowIDBatch(ids: ["static-cancel"]), force: true)
+}
+
+@Test func staticClearDefaultsToMainPool() async throws {
+    let a = TaskFlow(id: "static-clear") {}
+    await mainPool.register(a)
+
+    TaskFlow.clear(ids: ["static-clear"])
+
+    let deadline = Date().addingTimeInterval(1)
+    while a.pool != nil && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(a.pool == nil)
+}

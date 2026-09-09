@@ -49,6 +49,16 @@ fileprivate final class TaskFlowCompletionBox: @unchecked Sendable {
     }
 }
 
+/// Shuttles a batch of task ids across actor boundaries.
+///
+/// Task ids are `AnyHashable` and therefore not `Sendable`. The pool serializes
+/// every access to the ids it stores, so like `TaskFlow` itself this box may be
+/// `@unchecked Sendable`; it is only ever created, handed to the pool, and read
+/// on the pool actor.
+struct TaskFlowIDBatch: @unchecked Sendable {
+    let ids: [AnyHashable]
+}
+
 /// Internal result of a timed flow race.
 fileprivate enum TaskFlowResult {
     case value
@@ -407,6 +417,37 @@ extension TaskFlowPool {
             return task.expiresAfter > 0 && !isExpired(task, timestamp: timestamp)
         default:
             return false
+        }
+    }
+}
+
+extension TaskFlowPool {
+
+    /// Cancels every registered task whose `id` is in the batch.
+    ///
+    /// Only nodes that are currently `.ready` or `.flowing` are transitioned to
+    /// `.canceled`; other states are left untouched. Unregistered ids are ignored.
+    /// When `clear` is `true`, each canceled node (and its reachable graph) is also
+    /// released from the pool, subject to the usual clear-protection rules.
+    func cancel(_ batch: TaskFlowIDBatch, clear: Bool = false) {
+        for id in batch.ids {
+            if let task = pool[id] {
+                cancel(task, clear: clear)
+            }
+        }
+    }
+
+    /// Clears every registered task whose `id` is in the batch.
+    ///
+    /// Behaves like `clear(_:force:)` for each id: a node is only removed when its
+    /// `sinkCount` reaches zero (or `force` is `true`), so a shared dependency of
+    /// several requested roots is released exactly once its last owner is cleared.
+    /// Unregistered ids are ignored.
+    func clear(_ batch: TaskFlowIDBatch, force: Bool = false) {
+        for id in batch.ids {
+            if let task = pool[id] {
+                clear(task, force: force)
+            }
         }
     }
 }
