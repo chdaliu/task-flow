@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
 TaskFlow models your work as a dependency graph. Each task runs only after its
 dependencies complete, shared dependencies run exactly once, and independent
 tasks execute in parallel. Built on Swift Concurrency (actors, structured
-concurrency) and Combine.
+concurrency).
                        DESC
 
   s.homepage         = 'https://github.com/chdaliu/task-flow'
@@ -15,10 +15,10 @@ concurrency) and Combine.
 
   s.source           = { :git => 'https://github.com/chdaliu/task-flow.git', :tag => s.version.to_s }
 
-  s.ios.deployment_target = '15.0'
+  s.ios.deployment_target = '16.0'
   s.macos.deployment_target = '13.0'
   s.swift_version    = '6.0'
 
   s.source_files     = 'Sources/TaskFlow/**/*.swift'
-  s.frameworks       = 'Foundation', 'Combine'
+  s.frameworks       = 'Foundation'
 end

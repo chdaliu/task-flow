@@ -9,26 +9,27 @@
 //
 
 import Foundation
-import Combine
 
 /// A single task in a dependency graph.
 ///
 /// - A task holds references to its dependencies; it only runs once they are done.
 /// - It can be configured with a retry limit, an execution timeout, and an expiration age.
-/// - Its observable `state` drives waiting, retrying, and shared-run de-duplication.
+/// - Its `state` drives waiting, retrying, and shared-run de-duplication.
 ///
 /// Instances are intentionally mutable and are expected to be manipulated only
 /// through a `TaskFlowPool` actor, which serializes all state changes.
 public class TaskFlow: @unchecked Sendable {
-    
-    /// Lifecycle state of a task, observed through `@Published`.
-    enum State {
+
+    /// Lifecycle state of a task. Transitions are performed exclusively on the
+    /// owning `TaskFlowPool` actor; prefer `TaskFlowPool.state(of:)` for an
+    /// actor-isolated read.
+    public enum State: @unchecked Sendable {
         case ready
         case flowing
         case done(timestamp: TimeInterval)
         case error(error: Error?)
         case canceled
-        
+
         /// Whether execution has ended for this state and no further waiting is needed.
         var isTerminal: Bool {
             switch self {
@@ -38,7 +39,7 @@ public class TaskFlow: @unchecked Sendable {
                 return false
             }
         }
-        
+
         /// Whether the task was canceled.
         var isCanceled: Bool {
             if case .canceled = self {
@@ -47,54 +48,59 @@ public class TaskFlow: @unchecked Sendable {
             return false
         }
     }
-    
+
     /// A task body that reports completion (or failure) through its completion closure.
     /// The completion closure is `@escaping` and `@Sendable`; invoke it with `nil` on
     /// success or the error on failure. The parameter label is optional, so both
     /// `{ completion in ... }` and `{ (completion:) in ... }` call sites work.
     public typealias Handler = (_ completion: @escaping @Sendable (Error?) -> Void) -> Void
-    
-    @Published
+
+    /// The current lifecycle state. Only the owning pool actor may transition it;
+    /// terminal transitions resume the waiters registered in `waiters`.
     var state: State = .ready
-    
+
+    /// Continuations waiting for a terminal state, keyed by a unique token.
+    /// Access is confined to the pool actor that owns this task.
+    var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
     /// Unique identifier, used by the pool to register and de-duplicate tasks.
     let id: AnyHashable
-    
+
     /// Tasks that must complete before this task runs. Mutable so the graph can be
     /// assembled after construction (also used to build test graphs).
     var dependencies: [TaskFlow]
-    
+
     /// The work performed by this task.
     let handler: Handler
-    
+
     /// Duration after completion after which a cached `.done` result is considered stale
     /// and the task is re-run. `0` means the result never expires.
     public var expiresAfter: TimeInterval = 0
-    
+
     /// When `true`, a completed (`.done`) task is kept in the pool even when cleared;
     /// only `clear(force: true)` removes it. Protection never applies to failed,
     /// canceled, not-yet-run, or currently executing tasks.
     public var isClearProtected: Bool = false
-    
+
     /// Maximum time a single execution may take before it is treated as `.error(.timedOut)`.
     /// `0` disables the per-execution timeout.
     public var executionTimeout: TimeInterval = 0
-    
+
     /// Maximum number of retries after a failure. `0` means no retries.
     public var retryLimit: UInt = 0
-    
+
     /// Number of retries already consumed. Lifetime-capped by `retryLimit`.
     public internal(set) var retryCount: UInt = 0
-    
+
     /// Monotonic token bumped on every run so stale completions can be ignored.
     var runID: UInt64 = 0
-    
+
     public init(id: AnyHashable = UUID().uuidString, dependencies: [TaskFlow] = [], _ handler: @escaping Handler) {
         self.id = id
         self.dependencies = dependencies
         self.handler = handler
     }
-    
+
     /// Convenience initializer for synchronous task bodies.
     public convenience init(id: AnyHashable = UUID().uuidString, dependencies: [TaskFlow] = [], _ handler: @escaping () -> Void) {
         self.init(id: id, dependencies: dependencies) { completion in
@@ -102,38 +108,53 @@ public class TaskFlow: @unchecked Sendable {
             completion(nil)
         }
     }
-    
+
     /// Number of active references held by the pool. A shared dependency is only
     /// removed when this count reaches zero.
     var sinkCount: UInt = 0
-    
+
     /// The pool currently managing this task. Weak to avoid retain cycles.
     weak var pool: TaskFlowPool?
 }
 
 extension TaskFlow {
     public typealias Completion = @Sendable (_ error: Error?) -> Void
-    
-    /// Starts executing this task and its dependencies on a pool.
+
+    /// Runs this task and its dependencies on a pool, awaiting completion.
     ///
     /// - Parameters:
-    ///   - pool: The pool to run on; defaults to the process-wide `mainPool`.
+    ///   - pool: The pool to run on; defaults to the process-wide default pool.
+    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, all
+    ///     reachable nodes are canceled and a `.timedOut` error is thrown.
+    /// - Throws: The flow's failure: an underlying task error, `.canceled`,
+    ///   `.timedOut`, or `.circularDependency`.
+    public func flow(on pool: TaskFlowPool? = nil, timeout: TimeInterval = 0) async throws {
+        let pool = pool ?? mainPool
+        self.pool = pool
+        try await pool.flow(self, timeout: timeout)
+    }
+
+    /// Runs this task and its dependencies on a pool, reporting the outcome through
+    /// a callback. Prefer the `async` `flow(on:timeout:)` when possible.
+    ///
+    /// - Parameters:
+    ///   - pool: The pool to run on; defaults to the process-wide default pool.
     ///   - timeout: Whole-flow timeout. If the flow does not finish in time, all
     ///     reachable nodes are canceled and a `.timedOut` error is reported.
     ///   - completion: Invoked with `nil` on success or the error on failure.
     public func flow(on pool: TaskFlowPool? = nil, timeout: TimeInterval = 0, completion: Completion? = nil) {
         let pool = pool ?? mainPool
+        self.pool = pool
         Task {
             do {
                 try await pool.flow(self, timeout: timeout)
                 completion?(nil)
-            } catch(let error) {
+            } catch {
                 completion?(error)
             }
         }
-        self.pool = pool
     }
-    
+
     /// Requests cancellation of this task on its current pool, if any.
     /// The pool reference is captured synchronously so the request is not lost
     /// if the pool is later replaced or cleared.
@@ -150,7 +171,7 @@ extension TaskFlow {
             await pool.cancel(self, clear: clear)
         }
     }
-    
+
     /// Releases this task (and its reachable dependencies) from the pool, canceling it.
     ///
     /// A task is kept in the pool when it is currently executing (`.flowing`), or when
@@ -186,7 +207,7 @@ extension TaskFlow {
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to cancel. Unknown ids are ignored.
-    ///   - pool: The pool to act on; defaults to the process-wide `mainPool`.
+    ///   - pool: The pool to act on; defaults to the process-wide default pool.
     ///   - clear: When `true`, also releases the canceled tasks from the pool.
     ///   - completion: Called when the batch operation has finished.
     public static func cancel(
@@ -227,7 +248,7 @@ extension TaskFlow {
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to clear. Unknown ids are ignored.
-    ///   - pool: The pool to act on; defaults to the process-wide `mainPool`.
+    ///   - pool: The pool to act on; defaults to the process-wide default pool.
     ///   - force: When `true`, releases tasks even if they are still protected.
     ///   - completion: Called when the batch operation has finished.
     public static func clear(

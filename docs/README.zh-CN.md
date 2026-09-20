@@ -2,7 +2,7 @@
 
 一个轻量级的 Swift 原生任务编排库，把业务工作建模为**依赖图**。每个任务只会在其所有依赖完成后执行，共享依赖只运行一次，互相独立的任务会并行执行。
 
-基于 Swift 并发（`actor`、结构化并发）和 Combine 构建。
+基于 Swift 并发（`actor`、结构化并发）构建。
 
 ## 特性
 
@@ -20,7 +20,7 @@
 ## 系统要求
 
 - Swift 6.0+
-- iOS 15+ / macOS 13+
+- iOS 16+ / macOS 13+
 
 ## 安装
 
@@ -65,13 +65,21 @@ greet.flow { error in
 }
 ```
 
-`flow(on:timeout:completion:)` 在某个 pool 上执行该任务及其依赖。`pool` 参数默认使用进程级的 `mainPool`，因此直接写 `greet.flow { }` 即可。你也可以自行创建 `TaskFlowPool` 来隔离不同的流程：
+`flow(on:timeout:completion:)` 在某个 pool 上执行该任务及其依赖。`pool` 参数默认使用进程级默认池，因此直接写 `greet.flow { }` 即可。你也可以自行创建 `TaskFlowPool` 来隔离不同的流程：
 
 ```swift
 let pool = TaskFlowPool()
 greet.flow(on: pool) { error in
-    // 在 `pool` 上执行，而不是共享的 main pool
+    // 在 `pool` 上执行，而不是共享的默认池
 }
+```
+
+同时提供 `async` 形式，失败时抛出流程错误：
+
+```swift
+try await greet.flow()
+let pool = TaskFlowPool()
+try await greet.flow(on: pool, timeout: 10)
 ```
 
 ### 2. 任务依赖
@@ -102,6 +110,8 @@ let download = TaskFlow(id: "download") { completion in
     }.resume()
 }
 ```
+
+> **同步任务体会在 pool 的 actor 上执行。** 请保持它足够短——耗时或阻塞的同步任务体（`{ ... }` 便捷写法）会拖住共享该 pool 的所有 flow。真实工作请使用上面的 completion 形式，可配合 `executionTimeout`。
 
 ### 4. 重试与超时
 
@@ -156,12 +166,12 @@ config.expiresAfter = 60          // 缓存 1 分钟
 config.isClearProtected = true    // 完成后 clear() 永不释放
 ```
 
-也可以按已注册的任务 `id` 进行取消或清理，无需持有任务引用。这些静态方法默认使用进程级的 `mainPool`：
+也可以按已注册的任务 `id` 进行取消或清理，无需持有任务引用。这些静态方法默认使用进程级默认池：
 
 ```swift
-TaskFlow.cancel(ids: ["A", "B"])                    // 在 mainPool 上取消任务 "A" 和 "B"
+TaskFlow.cancel(ids: ["A", "B"])                    // 在默认池上取消任务 "A" 和 "B"
 TaskFlow.cancel(ids: ["A"], on: pool, clear: true)  // 在 `pool` 上取消并释放
-TaskFlow.clear(ids: ["A", "B"])                     // 在 mainPool 上释放任务及其依赖
+TaskFlow.clear(ids: ["A", "B"])                     // 在默认池上释放任务及其依赖
 TaskFlow.clear(ids: ["A"], on: pool, force: true)   // 即使结果仍受保护也强制释放
 
 TaskFlow.cancel(id: "A")                            // 单 id 便捷方法

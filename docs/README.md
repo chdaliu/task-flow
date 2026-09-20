@@ -2,7 +2,7 @@
 
 A lightweight, Swift-native task orchestration library that models your work as a **dependency graph**. Each task runs only after its dependencies complete, shared dependencies run exactly once, and independent tasks execute in parallel.
 
-Built on Swift Concurrency (actors, structured concurrency) and Combine.
+Built on Swift Concurrency (actors, structured concurrency).
 
 ## Features
 
@@ -20,7 +20,7 @@ Built on Swift Concurrency (actors, structured concurrency) and Combine.
 ## Requirements
 
 - Swift 6.0+
-- iOS 15+ / macOS 13+
+- iOS 16+ / macOS 13+
 
 ## Installation
 
@@ -66,7 +66,7 @@ greet.flow { error in
 ```
 
 `flow(on:timeout:completion:)` runs the task and its dependencies on a pool. The
-pool argument defaults to the process-wide `mainPool`, so a bare `greet.flow { }`
+pool argument defaults to the process-wide default pool, so a bare `greet.flow { }`
 works out of the box. You can also create your own `TaskFlowPool` to isolate
 groups of flows:
 
@@ -75,6 +75,14 @@ let pool = TaskFlowPool()
 greet.flow(on: pool) { error in
     // runs on `pool` instead of the shared main pool
 }
+```
+
+An `async` form is also available and throws the flow's error on failure:
+
+```swift
+try await greet.flow()
+let pool = TaskFlowPool()
+try await greet.flow(on: pool, timeout: 10)
 ```
 
 ### 2. Task dependencies
@@ -105,6 +113,11 @@ let download = TaskFlow(id: "download") { completion in
     }.resume()
 }
 ```
+
+> **Synchronous task bodies run on the pool's actor.** Keep them short — a
+> long-running or blocking synchronous body (the `{ ... }` convenience form) would
+> stall every flow sharing that pool. For real work, use the completion-based form
+> above, optionally with `executionTimeout`.
 
 ### 4. Retry and timeout
 
@@ -162,12 +175,12 @@ config.isClearProtected = true    // never released on clear() once done
 ```
 
 You can also cancel or clear tasks by their registered `id` without holding a
-reference. These static methods default to the process-wide `mainPool`:
+reference. These static methods default to the process-wide default pool:
 
 ```swift
-TaskFlow.cancel(ids: ["A", "B"])                     // cancel tasks "A" and "B" on mainPool
+TaskFlow.cancel(ids: ["A", "B"])                     // cancel tasks "A" and "B" on the default pool
 TaskFlow.cancel(ids: ["A"], on: pool, clear: true)   // cancel and release them on `pool`
-TaskFlow.clear(ids: ["A", "B"])                      // release tasks + dependencies on mainPool
+TaskFlow.clear(ids: ["A", "B"])                      // release tasks + dependencies on the default pool
 TaskFlow.clear(ids: ["A"], on: pool, force: true)    // release even if still protected
 
 TaskFlow.cancel(id: "A")                            // single-id convenience

@@ -141,7 +141,7 @@ fileprivate enum TestError: Error {
     }
 }
 
-@Test func dependenciesArePooledEvenWhenCanceled() async throws {
+@Test func canceledFlowReleasesRegisteredNodes() async throws {
     let pool = TaskFlowPool()
     var dRuns = 0
     let d = TaskFlow(id: "D") { dRuns += 1 }
@@ -152,8 +152,10 @@ fileprivate enum TestError: Error {
         try await pool.flow(a)
     }
     
-    #expect(d.sinkCount == 1)
-    await pool.clear(a)
+    // Even though the dependency was registered up front, the failed flow releases
+    // the ownership it acquired, so nothing leaks into the pool.
+    #expect(d.sinkCount == 0)
+    #expect(d.pool == nil)
     #expect(dRuns == 0)
 }
 
@@ -262,7 +264,7 @@ fileprivate enum TestError: Error {
     
     let flow = Task { try await pool.flow(a) }
     try await Task.sleep(for: .milliseconds(100))
-    d.state = .done(timestamp: Date().timeIntervalSince1970)
+    await pool.setState(d, .done(timestamp: Date().timeIntervalSince1970))
     try await flow.value
     
     var done = false
@@ -290,7 +292,7 @@ fileprivate enum TestError: Error {
     }
     #expect(xDone)
     
-    d.state = .done(timestamp: Date().timeIntervalSince1970)
+    await pool.setState(d, .done(timestamp: Date().timeIntervalSince1970))
     try await waiting.value
 }
 
@@ -477,6 +479,62 @@ fileprivate enum TestError: Error {
         done = true
     }
     #expect(done)
+}
+
+@Test func wholeFlowTimeoutOverridesPerTaskTimeoutState() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") { _ in }
+    a.executionTimeout = 0.5
+
+    await #expect(throws: TaskFlowError.timedOut) {
+        try await pool.flow(a, timeout: 0.05)
+    }
+
+    // Canceling the flow must win over the per-task timer: the node ends up
+    // `.canceled`, not `.error(.timedOut)`.
+    var canceled = false
+    if case .canceled = a.state {
+        canceled = true
+    }
+    #expect(canceled)
+}
+
+@Test func wholeFlowTimeoutReleasesOwnership() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") { _ in }
+
+    await #expect(throws: TaskFlowError.timedOut) {
+        try await pool.flow(a, timeout: 0.05)
+    }
+
+    // The timed-out flow released the ownership it acquired: the node is not
+    // left with an inflated sink count.
+    #expect(a.sinkCount == 0)
+
+    // A later flow on the canceled node throws `.canceled` and removes it.
+    await #expect(throws: TaskFlowError.canceled) {
+        try await pool.flow(a)
+    }
+    #expect(a.pool == nil)
+}
+
+@Test func abortedFlowCancelsStuckNode() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") { _ in }
+
+    let flow = Task { try await pool.flow(a) }
+    try await Task.sleep(for: .milliseconds(50))
+    flow.cancel()
+    await #expect(throws: TaskFlowError.canceled) {
+        try await flow.value
+    }
+
+    // The aborted flow must not leave a stuck `.flowing` node behind: a later
+    // flow fails fast with `.canceled` instead of hanging forever.
+    await #expect(throws: TaskFlowError.canceled) {
+        try await pool.flow(a)
+    }
+    #expect(a.pool == nil)
 }
 
 // MARK: - Clear protection
@@ -939,12 +997,11 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     let a = TaskFlow(id: "static-completion-cancel") {}
     await mainPool.register(a)
 
-    let finished = await withCheckedContinuation { continuation in
+    await withCheckedContinuation { continuation in
         TaskFlow.cancel(ids: ["static-completion-cancel"]) {
             continuation.resume()
         }
     }
-    _ = finished
     #expect(isCanceled(a))
 
     await mainPool.clear(TaskFlowIDBatch(ids: ["static-completion-cancel"]), force: true)
@@ -960,4 +1017,81 @@ func isCanceled(_ task: TaskFlow) -> Bool {
         }
     }
     #expect(a.pool == nil)
+}
+
+// MARK: - Duplicate ids and public introspection
+
+@Test func duplicateIDRunsCanonicalNodeOnce() async throws {
+    let pool = TaskFlowPool()
+    var runs = 0
+    let d = TaskFlow(id: "D") { runs += 1 }
+    let a1 = TaskFlow(id: "A", dependencies: [d]) {}
+    let a2 = TaskFlow(id: "A", dependencies: [d]) {}
+
+    try await pool.flow(a1)
+    try await pool.flow(a2)
+
+    // A recreated instance with a shared id is de-duplicated: only the canonical
+    // node runs, and the pooled execution state belongs to it.
+    #expect(runs == 1)
+    #expect(a1.sinkCount == 2)
+    #expect(a2.sinkCount == 0)
+    #expect(d.sinkCount == 2)
+    var a1Done = false
+    if case .done = a1.state {
+        a1Done = true
+    }
+    #expect(a1Done)
+}
+
+@Test func registeredStateIsPubliclyReadable() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "public-api") {}
+
+    try await pool.flow(a)
+
+    let state = await pool.state(of: "public-api")
+    var done = false
+    if case .done = state {
+        done = true
+    }
+    #expect(done)
+}
+
+// MARK: - Error-path ownership balance
+
+@Test func failedFlowBalancesSinkCounts() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") {}
+    d.state = .error(error: TestError.some)
+    let a = TaskFlow(id: "A", dependencies: [d]) {}
+
+    await #expect(throws: TestError.self) {
+        try await pool.flow(a)
+    }
+
+    #expect(d.sinkCount == 0)
+    #expect(d.pool == nil)
+    #expect(a.sinkCount == 0)
+    #expect(a.pool == nil)
+}
+
+// MARK: - Expiration under concurrency
+
+@Test func concurrentFlowsReuseExpiredDependencyOnce() async throws {
+    let pool = TaskFlowPool()
+    var runs = 0
+    let d = TaskFlow(id: "D") { runs += 1 }
+    d.expiresAfter = 60
+    d.state = .done(timestamp: Date().timeIntervalSince1970 - 120)
+    let a1 = TaskFlow(id: "A1", dependencies: [d]) {}
+    let a2 = TaskFlow(id: "A2", dependencies: [d]) {}
+
+    async let f1: Void = pool.flow(a1)
+    async let f2: Void = pool.flow(a2)
+    _ = try await (f1, f2)
+
+    // The stale result is re-run exactly once even though two flows observe it.
+    #expect(runs == 1)
+    #expect(d.sinkCount == 2)
 }
