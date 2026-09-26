@@ -16,6 +16,9 @@
 - **结果过期** —— 缓存结果可设置 `expiresAfter`，过期后重新执行。
 - **取消** —— 取消单个任务或整个可达依赖图。
 - **清理** —— `clear()` 把任务及其依赖从池中释放；执行中的任务与仍然新鲜的缓存结果会被保留（除非传 `force: true`）。
+- **异步 handler** —— `TaskFlow(operation:)` 可直接把 `async throws` 函数体作为任务。
+- **可等待的清理** —— `cancelAndWait()`/`clearAndWait()`（以及静态 `cancelAndWait(ids:)`/`clearAndWait(ids:)`）会等到池处理完成再返回。
+- **共享默认池** —— 不传 pool 时使用 `TaskFlowPool.shared`。
 
 ## 系统要求
 
@@ -111,7 +114,16 @@ let download = TaskFlow(id: "download") { completion in
 }
 ```
 
-> **同步任务体会在 pool 的 actor 上执行。** 请保持它足够短——耗时或阻塞的同步任务体（`{ ... }` 便捷写法）会拖住共享该 pool 的所有 flow。真实工作请使用上面的 completion 形式，可配合 `executionTimeout`。
+也可以直接把函数体写成 `async` operation：它在 pool 的 actor 之外运行，抛出的错误会像普通失败一样参与重试。
+
+```swift
+let download = TaskFlow(id: "download") {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    // 处理 data
+}
+```
+
+> **同步任务体会在 pool 的 actor 上执行。** 请保持它足够短——耗时或阻塞的同步任务体（`{ ... }` 便捷写法）会拖住共享该 pool 的所有 flow。真实工作请使用上面的 completion 形式（可配合 `executionTimeout`）或 `async` operation 形式。
 
 ### 4. 重试与超时
 
@@ -122,6 +134,8 @@ let fragile = TaskFlow(id: "fragile") { completion in
 fragile.retryLimit = 3          // 最多重试 3 次
 fragile.executionTimeout = 5    // 单次执行超过 5 秒视为失败
 ```
+
+重试预算按“运行链”计算：每次全新运行（包括在后续 flow 中过期重跑）都会重新获得 `retryLimit` 次重试。
 
 ### 5. 整个流程超时
 
@@ -148,11 +162,14 @@ task.cancel()            // 在当前池上取消该任务（保留在池中）
 task.cancel(clear: true) // 取消并把它（及依赖）从池中释放
 task.clear()             // 从池中释放任务及其依赖
 task.clear(force: true)  // 即使结果仍受保护也强制释放
+
+await task.cancelAndWait() // 等待池处理完成的 async 形式
+await task.clearAndWait(force: true)
 ```
 
 清理是“保护感知”的：
 
-- **执行中**的任务不会被释放。
+- **执行中**的任务在运行期间不会被释放。如果在运行中清理它，会在其运行到达终态后立刻释放（结果仍受保护时除外）。
 - **已完成**的任务在其结果受保护期间会留在池中——要么设置了 `isClearProtected`，要么 `expiresAfter` 尚未过期。此时 sink 计数仍会减到 `0`，缓存结果可被后续 flow 复用。
 - **失败**、已取消或尚未开始的任务会直接释放。
 - 传 `force: true` 可绕过保护，强制释放被保留的任务。
@@ -186,6 +203,13 @@ TaskFlow.cancel(ids: ["A"]) {
 }
 ```
 
+也可以直接用 `…AndWait` 变体等待结果：
+
+```swift
+await TaskFlow.cancelAndWait(ids: ["A"], on: pool, clear: true)
+await TaskFlow.clearAndWait(id: "B")
+```
+
 未注册的 id 会被忽略。与实例 API 一致，`cancel` 只对尚未完成的任务生效：已完成（`.done`）的任务不会被取消。
 
 ### 8. 循环依赖
@@ -202,10 +226,10 @@ do {
 
 ## 工作原理
 
-- `TaskFlowPool` 是一个 `actor`，拥有共享任务注册表与全部状态流转。
+- `TaskFlowPool` 是一个 `actor`，拥有共享任务注册表与全部状态流转；`TaskFlowPool.shared` 是进程级默认池。
 - `flow(_:)` 先校验依赖图（`layers`），注册所有节点，再按层执行。
 - `layers` 用 DFS 为每个节点计算最长依赖链深度，并用 visiting 集合检测环。
-- 池按 `id` 去重任务，并用 `sinkCount` 记录引用数；共享依赖只有在最后一个 owner 清理后才会被真正移除。
+- 每个 flow 为可达节点各登记一份所有权，清理时每个节点恰好释放一份；共享依赖只有在最后一个 owner 清理后才会被真正移除。失败或超时的 flow 只释放自己的份额，不会影响其他 flow 仍持有的节点。
 
 ## 许可证
 

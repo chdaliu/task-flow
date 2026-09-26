@@ -10,6 +10,8 @@
 
 import Foundation
 
+// MARK: - Model
+
 /// A single task in a dependency graph.
 ///
 /// - A task holds references to its dependencies; it only runs once they are done.
@@ -17,7 +19,8 @@ import Foundation
 /// - Its `state` drives waiting, retrying, and shared-run de-duplication.
 ///
 /// Instances are intentionally mutable and are expected to be manipulated only
-/// through a `TaskFlowPool` actor, which serializes all state changes.
+/// through a `TaskFlowPool` actor, which serializes all state changes. Configure a
+/// task (its `retryLimit`, `expiresAfter`, …) before flowing it.
 public class TaskFlow: @unchecked Sendable {
 
     /// Lifecycle state of a task. Transitions are performed exclusively on the
@@ -55,6 +58,9 @@ public class TaskFlow: @unchecked Sendable {
     /// `{ completion in ... }` and `{ (completion:) in ... }` call sites work.
     public typealias Handler = (_ completion: @escaping @Sendable (Error?) -> Void) -> Void
 
+    /// Callback form of a flow's outcome.
+    public typealias Completion = @Sendable (_ error: Error?) -> Void
+
     /// The current lifecycle state. Only the owning pool actor may transition it;
     /// terminal transitions resume the waiters registered in `waiters`.
     var state: State = .ready
@@ -86,14 +92,39 @@ public class TaskFlow: @unchecked Sendable {
     /// `0` disables the per-execution timeout.
     public var executionTimeout: TimeInterval = 0
 
-    /// Maximum number of retries after a failure. `0` means no retries.
+    /// Maximum number of retries after a failure, reset at the start of every new
+    /// run chain. `0` means no retries.
     public var retryLimit: UInt = 0
 
-    /// Number of retries already consumed. Lifetime-capped by `retryLimit`.
+    /// Number of retries consumed by the current run chain. Reset whenever a fresh
+    /// run starts (including an expired re-run), so each chain gets a full budget.
     public internal(set) var retryCount: UInt = 0
 
     /// Monotonic token bumped on every run so stale completions can be ignored.
     var runID: UInt64 = 0
+
+    /// Number of active references held by the pool. A shared dependency is only
+    /// removed when this count reaches zero.
+    var sinkCount: UInt = 0
+
+    private let poolLock = NSLock()
+    private weak var _pool: TaskFlowPool?
+
+    /// The pool currently managing this task. Weak to avoid retain cycles.
+    ///
+    /// Lock-guarded because `flow(on:)` (any thread) and the pool actor both write it.
+    var pool: TaskFlowPool? {
+        get {
+            poolLock.lock()
+            defer { poolLock.unlock() }
+            return _pool
+        }
+        set {
+            poolLock.lock()
+            defer { poolLock.unlock() }
+            _pool = newValue
+        }
+    }
 
     public init(id: AnyHashable = UUID().uuidString, dependencies: [TaskFlow] = [], _ handler: @escaping Handler) {
         self.id = id
@@ -102,6 +133,8 @@ public class TaskFlow: @unchecked Sendable {
     }
 
     /// Convenience initializer for synchronous task bodies.
+    ///
+    /// The body runs on the pool's actor; keep it short and non-blocking.
     public convenience init(id: AnyHashable = UUID().uuidString, dependencies: [TaskFlow] = [], _ handler: @escaping () -> Void) {
         self.init(id: id, dependencies: dependencies) { completion in
             handler()
@@ -109,23 +142,40 @@ public class TaskFlow: @unchecked Sendable {
         }
     }
 
-    /// Number of active references held by the pool. A shared dependency is only
-    /// removed when this count reaches zero.
-    var sinkCount: UInt = 0
-
-    /// The pool currently managing this task. Weak to avoid retain cycles.
-    weak var pool: TaskFlowPool?
+    /// Convenience initializer for asynchronous task bodies.
+    ///
+    /// The operation runs in its own task off the pool's actor, so it never blocks
+    /// other flows. Throwing reports a failure and participates in retries like any
+    /// other error.
+    @_disfavoredOverload
+    public convenience init(
+        id: AnyHashable = UUID().uuidString,
+        dependencies: [TaskFlow] = [],
+        operation: @escaping @Sendable () async throws -> Void
+    ) {
+        self.init(id: id, dependencies: dependencies) { completion in
+            Task {
+                do {
+                    try await operation()
+                    completion(nil)
+                } catch {
+                    completion(error)
+                }
+            }
+        }
+    }
 }
 
+// MARK: - Execution API
+
 extension TaskFlow {
-    public typealias Completion = @Sendable (_ error: Error?) -> Void
 
     /// Runs this task and its dependencies on a pool, awaiting completion.
     ///
     /// - Parameters:
-    ///   - pool: The pool to run on; defaults to the process-wide default pool.
-    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, all
-    ///     reachable nodes are canceled and a `.timedOut` error is thrown.
+    ///   - pool: The pool to run on; defaults to `TaskFlowPool.shared`.
+    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, the
+    ///     aborted run's nodes are canceled and a `.timedOut` error is thrown.
     /// - Throws: The flow's failure: an underlying task error, `.canceled`,
     ///   `.timedOut`, or `.circularDependency`.
     public func flow(on pool: TaskFlowPool? = nil, timeout: TimeInterval = 0) async throws {
@@ -138,9 +188,9 @@ extension TaskFlow {
     /// a callback. Prefer the `async` `flow(on:timeout:)` when possible.
     ///
     /// - Parameters:
-    ///   - pool: The pool to run on; defaults to the process-wide default pool.
-    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, all
-    ///     reachable nodes are canceled and a `.timedOut` error is reported.
+    ///   - pool: The pool to run on; defaults to `TaskFlowPool.shared`.
+    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, the
+    ///     aborted run's nodes are canceled and a `.timedOut` error is reported.
     ///   - completion: Invoked with `nil` on success or the error on failure.
     public func flow(on pool: TaskFlowPool? = nil, timeout: TimeInterval = 0, completion: Completion? = nil) {
         let pool = pool ?? mainPool
@@ -172,12 +222,26 @@ extension TaskFlow {
         }
     }
 
+    /// Cancels this task and waits until the pool has processed the request.
+    ///
+    /// Async counterpart of `cancel(clear:)`, useful when the cleanup must be
+    /// observable before continuing.
+    public func cancelAndWait(clear: Bool = false) async {
+        guard let pool = self.pool else {
+            return
+        }
+        await pool.cancel(self, clear: clear)
+    }
+
     /// Releases this task (and its reachable dependencies) from the pool, canceling it.
     ///
     /// A task is kept in the pool when it is currently executing (`.flowing`), or when
     /// its `.done` result is still within the protection window (`isClearProtected`, or
     /// `expiresAfter` has not elapsed yet). In those cases only the sink count drops and
     /// the cached result stays reusable. Pass `force: true` to release it regardless.
+    ///
+    /// A task cleared while `.flowing` is released automatically once its run reaches a
+    /// terminal state, unless the result is protected.
     ///
     /// The pool reference is captured before it is cleared so the async cleanup always
     /// runs against the correct pool; it is only nilled if the task is actually removed.
@@ -190,7 +254,19 @@ extension TaskFlow {
             await pool.clear(self, force: force)
         }
     }
+
+    /// Releases this task and waits until the pool has processed the request.
+    ///
+    /// Async counterpart of `clear(force:)`.
+    public func clearAndWait(force: Bool = false) async {
+        guard let pool = self.pool else {
+            return
+        }
+        await pool.clear(self, force: force)
+    }
 }
+
+// MARK: - Static API by id
 
 extension TaskFlow {
 
@@ -203,11 +279,11 @@ extension TaskFlow {
     /// release each task (and its reachable dependency graph) from the pool.
     ///
     /// The operation runs asynchronously on the pool; `completion` is invoked once
-    /// it has finished.
+    /// it has finished. Use `cancelAndWait(ids:on:clear:)` to await it instead.
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to cancel. Unknown ids are ignored.
-    ///   - pool: The pool to act on; defaults to the process-wide default pool.
+    ///   - pool: The pool to act on; defaults to `TaskFlowPool.shared`.
     ///   - clear: When `true`, also releases the canceled tasks from the pool.
     ///   - completion: Called when the batch operation has finished.
     public static func cancel(
@@ -244,11 +320,11 @@ extension TaskFlow {
     /// ignored.
     ///
     /// The operation runs asynchronously on the pool; `completion` is invoked once
-    /// it has finished.
+    /// it has finished. Use `clearAndWait(ids:on:force:)` to await it instead.
     ///
     /// - Parameters:
     ///   - ids: The ids of the tasks to clear. Unknown ids are ignored.
-    ///   - pool: The pool to act on; defaults to the process-wide default pool.
+    ///   - pool: The pool to act on; defaults to `TaskFlowPool.shared`.
     ///   - force: When `true`, releases tasks even if they are still protected.
     ///   - completion: Called when the batch operation has finished.
     public static func clear(
@@ -275,5 +351,45 @@ extension TaskFlow {
         completion: (@Sendable () -> Void)? = nil
     ) {
         clear(ids: [id], on: pool, force: force, completion: completion)
+    }
+
+    /// Cancels every task registered with one of the given `ids` and waits for the
+    /// pool to finish, without a completion callback.
+    public static func cancelAndWait(
+        ids: [AnyHashable],
+        on pool: TaskFlowPool? = nil,
+        clear: Bool = false
+    ) async {
+        let pool = pool ?? mainPool
+        await pool.cancel(TaskFlowIDBatch(ids: ids), clear: clear)
+    }
+
+    /// Cancels the task registered with the given `id` and waits for the pool.
+    public static func cancelAndWait(
+        id: AnyHashable,
+        on pool: TaskFlowPool? = nil,
+        clear: Bool = false
+    ) async {
+        await cancelAndWait(ids: [id], on: pool, clear: clear)
+    }
+
+    /// Clears every task registered with one of the given `ids` and waits for the
+    /// pool to finish, without a completion callback.
+    public static func clearAndWait(
+        ids: [AnyHashable],
+        on pool: TaskFlowPool? = nil,
+        force: Bool = false
+    ) async {
+        let pool = pool ?? mainPool
+        await pool.clear(TaskFlowIDBatch(ids: ids), force: force)
+    }
+
+    /// Clears the task registered with the given `id` and waits for the pool.
+    public static func clearAndWait(
+        id: AnyHashable,
+        on pool: TaskFlowPool? = nil,
+        force: Bool = false
+    ) async {
+        await clearAndWait(ids: [id], on: pool, force: force)
     }
 }

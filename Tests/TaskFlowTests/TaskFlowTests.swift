@@ -235,7 +235,7 @@ fileprivate enum TestError: Error {
     var log: [String] = []
     let d = TaskFlow(id: "D") { log.append("D") }
     d.expiresAfter = 60
-    d.state = .done(timestamp: Date().timeIntervalSince1970 - 120)
+    d.state = .done(timestamp: TaskFlowClock.now - 120)
     let a = TaskFlow(id: "A", dependencies: [d]) { log.append("A") }
     
     try await pool.flow(a)
@@ -248,7 +248,7 @@ fileprivate enum TestError: Error {
     var log: [String] = []
     let d = TaskFlow(id: "D") { log.append("D") }
     d.expiresAfter = 60
-    d.state = .done(timestamp: Date().timeIntervalSince1970)
+    d.state = .done(timestamp: TaskFlowClock.now)
     let a = TaskFlow(id: "A", dependencies: [d]) { log.append("A") }
     
     try await pool.flow(a)
@@ -264,7 +264,7 @@ fileprivate enum TestError: Error {
     
     let flow = Task { try await pool.flow(a) }
     try await Task.sleep(for: .milliseconds(100))
-    await pool.setState(d, .done(timestamp: Date().timeIntervalSince1970))
+    await pool.setState(d, .done(timestamp: TaskFlowClock.now))
     try await flow.value
     
     var done = false
@@ -292,7 +292,7 @@ fileprivate enum TestError: Error {
     }
     #expect(xDone)
     
-    await pool.setState(d, .done(timestamp: Date().timeIntervalSince1970))
+    await pool.setState(d, .done(timestamp: TaskFlowClock.now))
     try await waiting.value
 }
 
@@ -646,7 +646,7 @@ fileprivate enum TestError: Error {
 @Test func doneWithoutExpiryIsCleared() async throws {
     let pool = TaskFlowPool()
     let a = TaskFlow(id: "A") {}
-    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    a.state = .done(timestamp: TaskFlowClock.now)
     await pool.register(a)
     
     await pool.clear(a)
@@ -658,7 +658,7 @@ fileprivate enum TestError: Error {
     let pool = TaskFlowPool()
     let a = TaskFlow(id: "A") {}
     a.expiresAfter = 60
-    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    a.state = .done(timestamp: TaskFlowClock.now)
     await pool.register(a)
     
     await pool.clear(a)
@@ -676,7 +676,7 @@ fileprivate enum TestError: Error {
     let pool = TaskFlowPool()
     let a = TaskFlow(id: "A") {}
     a.expiresAfter = 60
-    a.state = .done(timestamp: Date().timeIntervalSince1970 - 120)
+    a.state = .done(timestamp: TaskFlowClock.now - 120)
     await pool.register(a)
     
     await pool.clear(a)
@@ -694,7 +694,7 @@ fileprivate enum TestError: Error {
     let a = TaskFlow(id: "A") {}
     a.expiresAfter = 60
     a.isClearProtected = true
-    a.state = .done(timestamp: Date().timeIntervalSince1970 - 120)
+    a.state = .done(timestamp: TaskFlowClock.now - 120)
     await pool.register(a)
     
     await pool.clear(a)
@@ -711,7 +711,7 @@ fileprivate enum TestError: Error {
     d.expiresAfter = 60
     let a = TaskFlow(id: "A", dependencies: [d]) {}
     try await pool.flow(a)
-    d.state = .done(timestamp: Date().timeIntervalSince1970)
+    d.state = .done(timestamp: TaskFlowClock.now)
     
     await pool.clear(a)
     #expect(d.sinkCount == 0)
@@ -880,7 +880,7 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     let a = TaskFlow(id: "A") {}
     a.expiresAfter = 60
     a.isClearProtected = true
-    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    a.state = .done(timestamp: TaskFlowClock.now)
     await pool.register(a)
 
     await pool.clear(TaskFlowIDBatch(ids: ["A"]))
@@ -923,7 +923,7 @@ func isCanceled(_ task: TaskFlow) -> Bool {
 @Test func cancelByIDsIsNoOpOnCompletedTask() async throws {
     let pool = TaskFlowPool()
     let a = TaskFlow(id: "A") {}
-    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    a.state = .done(timestamp: TaskFlowClock.now)
     await pool.register(a)
 
     await pool.cancel(TaskFlowIDBatch(ids: ["A"]))
@@ -955,7 +955,7 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     let a = TaskFlow(id: "A") {}
     a.expiresAfter = 60
     a.isClearProtected = true
-    a.state = .done(timestamp: Date().timeIntervalSince1970)
+    a.state = .done(timestamp: TaskFlowClock.now)
     await pool.register(a)
 
     await pool.clear(TaskFlowIDBatch(ids: ["A"]))
@@ -1083,7 +1083,7 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     var runs = 0
     let d = TaskFlow(id: "D") { runs += 1 }
     d.expiresAfter = 60
-    d.state = .done(timestamp: Date().timeIntervalSince1970 - 120)
+    d.state = .done(timestamp: TaskFlowClock.now - 120)
     let a1 = TaskFlow(id: "A1", dependencies: [d]) {}
     let a2 = TaskFlow(id: "A2", dependencies: [d]) {}
 
@@ -1094,4 +1094,242 @@ func isCanceled(_ task: TaskFlow) -> Bool {
     // The stale result is re-run exactly once even though two flows observe it.
     #expect(runs == 1)
     #expect(d.sinkCount == 2)
+}
+
+// MARK: - Ownership release regressions
+
+@Test func clearReleasesSharedIntermediateDependency() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") {}
+    let b = TaskFlow(id: "B", dependencies: [d]) {}
+    let a1 = TaskFlow(id: "A1", dependencies: [b]) {}
+    let a2 = TaskFlow(id: "A2", dependencies: [b]) {}
+
+    try await pool.flow(a1)
+    try await pool.flow(a2)
+
+    await pool.clear(a1)
+    await pool.clear(a2)
+
+    // Each clear released one full ownership share, so the shared intermediate
+    // node and its dependency do not linger with a stranded sink count.
+    #expect(a1.pool == nil)
+    #expect(a2.pool == nil)
+    #expect(b.pool == nil)
+    #expect(d.pool == nil)
+    #expect(b.sinkCount == 0)
+    #expect(d.sinkCount == 0)
+}
+
+@Test func repeatedFlowOfSameRootReleasesDependencies() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") {}
+    let a = TaskFlow(id: "A", dependencies: [d]) {}
+
+    try await pool.flow(a)
+    try await pool.flow(a)
+    #expect(a.sinkCount == 2)
+    #expect(d.sinkCount == 2)
+
+    await pool.clear(a)
+    await pool.clear(a)
+
+    #expect(a.pool == nil)
+    #expect(d.pool == nil)
+    #expect(d.sinkCount == 0)
+}
+
+@Test func failedFlowDoesNotReleaseOtherFlowsOwnership() async throws {
+    let pool = TaskFlowPool()
+    let d = TaskFlow(id: "D") { completion in
+        Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            completion(nil)
+        }
+    }
+    let sharedRoot = TaskFlow(id: "Shared", dependencies: [d]) {}
+    let failingSibling = TaskFlow(id: "X") { completion in
+        completion(TestError.some)
+    }
+    let failingRoot = TaskFlow(id: "Failing", dependencies: [d, failingSibling]) {}
+
+    async let shared: Void = pool.flow(sharedRoot)
+    try await Task.sleep(for: .milliseconds(50))
+    await #expect(throws: TestError.self) {
+        try await pool.flow(failingRoot)
+    }
+
+    // The failing flow released only its own share; the shared flow still owns `d`
+    // and is not canceled or removed by the unrelated failure.
+    #expect(d.sinkCount == 1)
+    #expect(d.pool != nil)
+
+    try await shared
+    var sharedDone = false
+    if case .done = sharedRoot.state {
+        sharedDone = true
+    }
+    #expect(sharedDone)
+
+    await pool.clear(sharedRoot)
+    #expect(d.pool == nil)
+    #expect(d.sinkCount == 0)
+}
+
+@Test func wholeFlowTimeoutDoesNotCancelSharedNode() async throws {
+    let pool = TaskFlowPool()
+    let slow = TaskFlow(id: "Slow") { completion in
+        Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            completion(nil)
+        }
+    }
+    let r1 = TaskFlow(id: "R1", dependencies: [slow]) {}
+    let r2 = TaskFlow(id: "R2", dependencies: [slow]) {}
+
+    async let shared: Void = pool.flow(r2)
+    try await Task.sleep(for: .milliseconds(50))
+    await #expect(throws: TaskFlowError.timedOut) {
+        try await pool.flow(r1, timeout: 0.05)
+    }
+
+    // The timed-out flow must not poison a node another flow is still using.
+    try await shared
+    var r2Done = false
+    if case .done = r2.state {
+        r2Done = true
+    }
+    #expect(r2Done)
+    #expect(!isCanceled(slow))
+
+    await pool.clear(r2)
+    #expect(slow.pool == nil)
+}
+
+@Test func clearedFlowingTaskIsReleasedOnCompletion() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") { completion in
+        Task {
+            try? await Task.sleep(for: .milliseconds(100))
+            completion(nil)
+        }
+    }
+
+    let flow = Task { try await pool.flow(a) }
+    try await Task.sleep(for: .milliseconds(30))
+    await pool.clear(a)
+    #expect(a.pool != nil) // executing tasks are retained on clear
+
+    try await flow.value
+
+    let deadline = Date().addingTimeInterval(1)
+    while a.pool != nil && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    // Once the run finished, the unowned, unprotected node was released.
+    #expect(a.pool == nil)
+    #expect(a.sinkCount == 0)
+}
+
+// MARK: - Retry budget per run chain
+
+@Test func retryBudgetResetsForEachRun() async throws {
+    let pool = TaskFlowPool()
+    let log = TestLog()
+    var base = 0
+    var succeedAfter = 3
+    let t = TaskFlow(id: "T") { completion in
+        log.add("run")
+        if log.all.count - base >= succeedAfter {
+            completion(nil)
+        } else {
+            completion(TestError.some)
+        }
+    }
+    t.retryLimit = 2
+
+    try await pool.flow(t)
+    #expect(log.all.count == 3)
+    #expect(t.retryCount == 2)
+
+    // An expired re-run starts a fresh run chain and gets a full retry budget.
+    base = log.all.count
+    succeedAfter = 4
+    t.retryLimit = 3
+    t.expiresAfter = 60
+    t.state = .done(timestamp: TaskFlowClock.now - 120)
+
+    try await pool.flow(t)
+    #expect(log.all.count == 7)
+    #expect(t.retryCount == 3)
+}
+
+@Test func retryBudgetResetsForErroredTask() async throws {
+    let pool = TaskFlowPool()
+    var attempts = 0
+    let t = TaskFlow(id: "T") { completion in
+        attempts += 1
+        completion(TestError.some)
+    }
+    t.retryLimit = 1
+
+    await #expect(throws: TestError.self) {
+        try await pool.flow(t)
+    }
+    #expect(attempts == 2)
+    #expect(t.retryCount == 1)
+
+    // A new flow gets a fresh budget instead of failing fast on the old count:
+    // with `retryLimit == 1` the errored task is re-run once more.
+    await #expect(throws: TestError.self) {
+        try await pool.flow(t)
+    }
+    #expect(attempts == 3)
+    #expect(t.retryCount == 1)
+}
+
+// MARK: - Async conveniences
+
+@Test func asyncCancelAndClearConveniences() async throws {
+    let pool = TaskFlowPool()
+    let a = TaskFlow(id: "A") {}
+    await pool.register(a)
+
+    await a.cancelAndWait()
+    #expect(isCanceled(a))
+
+    await a.clearAndWait(force: true)
+    #expect(a.pool == nil)
+
+    let b = TaskFlow(id: "B") {}
+    await pool.register(b)
+
+    await TaskFlow.cancelAndWait(id: "B", on: pool)
+    #expect(isCanceled(b))
+
+    await TaskFlow.clearAndWait(ids: ["B"], on: pool, force: true)
+    #expect(b.pool == nil)
+}
+
+@Test func asyncHandlerCompletesAndRetries() async throws {
+    let pool = TaskFlowPool()
+    let log = TestLog()
+    let d = TaskFlow(id: "D") {
+        log.add("run\(log.all.count + 1)")
+        try await Task.sleep(for: .milliseconds(10))
+        if log.all.count == 1 {
+            throw TestError.some
+        }
+    }
+    d.retryLimit = 1
+    let a = TaskFlow(id: "A", dependencies: [d]) {}
+
+    try await pool.flow(a)
+
+    #expect(log.all == ["run1", "run2"])
+    #expect(d.retryCount == 1)
+}
+
+@Test func sharedPoolIsExposed() async throws {
+    #expect(TaskFlowPool.shared === mainPool)
 }

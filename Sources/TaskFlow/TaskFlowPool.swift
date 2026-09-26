@@ -13,10 +13,16 @@
 
 import Foundation
 
+// MARK: - Pool
+
 /// Serializes all access to the shared task registry and state transitions.
 public actor TaskFlowPool {
     /// Tasks registered on this pool, keyed by `TaskFlow.id`.
     fileprivate var pool: [AnyHashable: TaskFlow] = [:]
+
+    /// The process-wide default pool used when `flow(on:)` is called without an
+    /// explicit pool. Exposed so callers can inspect and manage it directly.
+    public static let shared = TaskFlowPool()
 
     /// Creates a new, isolated pool. Pass it to `flow(on:)` to run tasks on it,
     /// or omit the pool argument to use the process-wide default pool.
@@ -28,6 +34,11 @@ public actor TaskFlowPool {
         pool[id]?.state
     }
 }
+
+/// The process-wide default pool; alias for `TaskFlowPool.shared`.
+let mainPool: TaskFlowPool = .shared
+
+// MARK: - Errors
 
 /// Errors surfaced by the pool.
 ///
@@ -61,11 +72,23 @@ extension TaskFlowError: LocalizedError {
     }
 }
 
+// MARK: - Clock
+
+/// Monotonic clock used for result-expiration timestamps.
+///
+/// Uptime does not jump when the wall clock is adjusted, so cached results do not
+/// expire early or late because of system time changes.
+enum TaskFlowClock {
+    static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+}
+
+// MARK: - Transport types
+
 /// Carries the outcome of a single run of a task.
 ///
 /// Each run gets a fresh box tagged with the run token so that a completion
 /// arriving from an older, superseded run is ignored.
-fileprivate final class TaskFlowCompletionBox: @unchecked Sendable {
+private final class TaskFlowCompletionBox: @unchecked Sendable {
     let runID: UInt64
     var error: (any Error)?
 
@@ -86,11 +109,13 @@ struct TaskFlowIDBatch: @unchecked Sendable {
 }
 
 /// Internal result of a timed flow race.
-fileprivate enum TaskFlowResult {
+private enum TaskFlowResult {
     case value
     case error(any Error)
     case timedOut
 }
+
+// MARK: - Execution
 
 extension TaskFlowPool {
 
@@ -103,8 +128,9 @@ extension TaskFlowPool {
     ///
     /// - Parameters:
     ///   - task: The root task to run.
-    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, all
-    ///     reachable nodes are canceled and `.timedOut` is thrown.
+    ///   - timeout: Whole-flow timeout. If the flow does not finish in time, the
+    ///     aborted run releases its ownership and cancels the nodes it left stuck,
+    ///     then `.timedOut` is thrown. Nodes shared with other flows are unaffected.
     /// - Throws: The flow's failure: an underlying task error, `.canceled`,
     ///   `.timedOut`, or `.circularDependency`.
     public func flow(_ task: TaskFlow, timeout: TimeInterval = 0) async throws {
@@ -138,32 +164,17 @@ extension TaskFlowPool {
         case .error(let error):
             throw error
         case .timedOut:
-            // Prevent later flows from hanging on nodes left `.flowing` by a timed-out run.
-            cancelGraph(task)
+            // The canceled run has already released its ownership and canceled the
+            // nodes it left `.flowing`, so shared nodes owned by other flows survive.
             throw TaskFlowError.timedOut
         }
-    }
-
-    /// Cancels a task and every node reachable from it (cycle-safe via a visited set).
-    func cancelGraph(_ task: TaskFlow) {
-        var visited: Set<ObjectIdentifier> = []
-        func visit(_ node: TaskFlow) {
-            guard visited.insert(ObjectIdentifier(node)).inserted else {
-                return
-            }
-            cancel(node)
-            for dependency in node.dependencies {
-                visit(dependency)
-            }
-        }
-        visit(task)
     }
 
     /// Validates the graph, registers its nodes, then executes it layer by layer.
     ///
     /// On failure, the ownership every registered node gained for this flow is
-    /// released via `clear`, so a failed run cannot leak retained nodes into the
-    /// pool or skew shared `sinkCount`s.
+    /// released exactly once (see `releaseRegistered`), so a failed run cannot leak
+    /// retained nodes into the pool or skew shared `sinkCount`s.
     func runFlow(_ task: TaskFlow) async throws {
         let queues = try layers(of: task)
         var registered: [TaskFlow] = []
@@ -194,21 +205,224 @@ extension TaskFlowPool {
                 throw TaskFlowError.canceled
             }
         } catch {
-            for node in registered {
-                // A node left `.flowing` by an aborted flow (e.g. its awaiting task was
-                // canceled) would otherwise linger forever, making later flows hang on a
-                // terminal state that never arrives. When this flow was its last owner,
-                // cancel it before releasing so a re-flow fails fast instead of hanging.
-                // Shared nodes (still owned by other flows) are left untouched.
-                let target = pool[node.id] ?? node
-                if target.sinkCount == 1, case .flowing = target.state {
-                    cancel(target)
-                }
-                clear(node)
-            }
+            releaseRegistered(registered)
             throw error
         }
     }
+
+    /// Runs a single node, dispatching based on its current state.
+    ///
+    /// Every entry that starts a new run chain resets the retry budget, so a node
+    /// re-run in a later flow (or after expiration) gets a full `retryLimit` again.
+    func execute(_ node: TaskFlow) async throws {
+        let target = pool[node.id] ?? node
+        switch target.state {
+        case .ready:
+            target.retryCount = 0
+            await run(target)
+            try await resolveTerminal(target)
+        case .done(let timestamp):
+            if isExpired(target, timestamp: timestamp) {
+                target.retryCount = 0
+                await run(target)
+                try await resolveTerminal(target)
+            }
+        case .flowing:
+            // Another flow is already running this node; wait for it. The retry
+            // budget belongs to that run chain and is left untouched.
+            await waitForTerminal(target)
+            try await resolveTerminal(target)
+        case .error:
+            target.retryCount = 0
+            try await retry(target)
+        case .canceled:
+            throw TaskFlowError.canceled
+        }
+    }
+
+    /// Starts a single execution: marks the node flowing, invokes its handler,
+    /// then waits for the terminal state (optionally bounded by `executionTimeout`).
+    ///
+    /// A fresh (non-retry) run resets the retry budget, so every run chain gets up
+    /// to `retryLimit` retries regardless of failures consumed by earlier chains.
+    func run(_ target: TaskFlow, isRetry: Bool = false) async {
+        if !isRetry {
+            target.retryCount = 0
+        }
+        setState(target, .flowing)
+        target.runID &+= 1
+        let box = TaskFlowCompletionBox(runID: target.runID)
+        target.handler { [weak self, weak target] error in
+            guard let self, let target else {
+                return
+            }
+            box.error = error
+            Task { await self.complete(target, box: box) }
+        }
+        if target.executionTimeout > 0 {
+            await waitForTerminal(target, timeout: target.executionTimeout)
+        } else {
+            await waitForTerminal(target)
+        }
+    }
+
+    /// Records the result of a run, ignoring completions that are no longer current.
+    private func complete(_ target: TaskFlow, box: TaskFlowCompletionBox) async {
+        guard box.runID == target.runID else {
+            return
+        }
+        switch target.state {
+        case .flowing:
+            if let error = box.error {
+                setState(target, .error(error: error))
+            } else {
+                setState(target, .done(timestamp: TaskFlowClock.now))
+            }
+            // A node cleared while it was still running has no remaining owner:
+            // release it now instead of leaving it in the pool forever.
+            removeIfUnownedAndUnretained(target)
+        default:
+            break
+        }
+    }
+
+    /// Re-runs a failed node up to `retryLimit` times, then surfaces the underlying error.
+    func retry(_ target: TaskFlow) async throws {
+        guard target.retryCount < target.retryLimit else {
+            if case .error(let error) = target.state {
+                throw error ?? TaskFlowError.unknown
+            }
+            throw TaskFlowError.unknown
+        }
+        target.retryCount += 1
+        setState(target, .ready)
+        await run(target, isRetry: true)
+        try await resolveTerminal(target)
+    }
+
+    /// Applies retry/expiration policy after a node reached a terminal state.
+    func resolveTerminal(_ target: TaskFlow) async throws {
+        switch target.state {
+        case .done(let timestamp):
+            if isExpired(target, timestamp: timestamp) {
+                await run(target)
+                try await resolveTerminal(target)
+            }
+        case .error:
+            try await retry(target)
+        case .canceled:
+            throw TaskFlowError.canceled
+        default:
+            break
+        }
+    }
+
+    /// Returns whether a `.done` result is too old to be reused.
+    func isExpired(_ target: TaskFlow, timestamp: TimeInterval) -> Bool {
+        target.expiresAfter > 0 && TaskFlowClock.now - timestamp > target.expiresAfter
+    }
+
+    /// Suspends until the task reaches a terminal state (or returns immediately if it already has).
+    ///
+    /// Waiter registration happens on the pool actor (via `waitOnActor`), and only
+    /// the actor ever transitions `state` (via `setState`), so waiting never reads
+    /// or writes `state`/`waiters` from a non-isolated context.
+    ///
+    /// The waiter is cancellation-aware: if the awaiting task is canceled, its own
+    /// continuation is removed and resumed so it cannot strand a task group's
+    /// implicit await or leak a registration.
+    func waitForTerminal(_ target: TaskFlow) async {
+        guard !target.state.isTerminal else {
+            return
+        }
+        let token = UUID()
+        await withTaskCancellationHandler {
+            await self.waitOnActor(target, token: token)
+        } onCancel: {
+            Task { await self.cancelWaiter(target, token: token) }
+        }
+    }
+
+    /// Registers (or aborts) a waiter on the actor.
+    ///
+    /// Runs actor-isolated and atomically re-checks terminal state and the waiting
+    /// task's cancellation, so a waiter canceled before registration never strands.
+    /// The continuation is resumed exactly once: either by the terminal transition
+    /// (via `setState`) or by `cancelWaiter`.
+    private func waitOnActor(_ target: TaskFlow, token: UUID) async {
+        if target.state.isTerminal || Task.isCancelled {
+            return
+        }
+        #if compiler(>=6.2)
+        // From Swift 6.2 on, `withCheckedContinuation` is `nonisolated(nonsending)`
+        // and inherits the caller's isolation, so the body may touch actor state.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            target.waiters[token] = continuation
+        }
+        #else
+        await withCheckedContinuation(isolation: self) { (continuation: CheckedContinuation<Void, Never>) in
+            target.waiters[token] = continuation
+        }
+        #endif
+    }
+
+    /// Removes and resumes the waiter registered under `token`, if any.
+    private func cancelWaiter(_ target: TaskFlow, token: UUID) async {
+        if let waiter = target.waiters.removeValue(forKey: token) {
+            waiter.resume()
+        }
+    }
+
+    /// Suspends until the task reaches a terminal state or the timeout elapses,
+    /// marking the task `.error(.timedOut)` if the timeout wins.
+    func waitForTerminal(_ target: TaskFlow, timeout: TimeInterval) async {
+        guard !target.state.isTerminal else {
+            return
+        }
+        // Race the terminal wait against a background timer. The timer marks the
+        // node `.error(.timedOut)` on the actor (resuming every waiter) instead of
+        // racing a task group, so a canceled waiter can never strand the group.
+        let timeoutTask = Task {
+            try? await Task.sleep(for: .seconds(timeout))
+            // Cancellation of the run (or its flow) is not a per-task timeout: once
+            // canceled, leave the terminal transition to the flow's cleanup so a
+            // timed-out flow cannot mark nodes `.error(.timedOut)` instead of `.canceled`.
+            guard !Task.isCancelled else {
+                return
+            }
+            await self.markTimedOut(target)
+        }
+        await waitForTerminal(target)
+        timeoutTask.cancel()
+    }
+
+    /// Marks a node `.error(.timedOut)` unless it already reached a terminal state.
+    private func markTimedOut(_ target: TaskFlow) async {
+        if !target.state.isTerminal {
+            setState(target, .error(error: TaskFlowError.timedOut))
+            removeIfUnownedAndUnretained(target)
+        }
+    }
+
+    /// Transitions a node to a new state, resuming every waiter when the state is terminal.
+    ///
+    /// This is the single write path for `state` and must only be called on the
+    /// pool actor. Non-terminal transitions leave waiters registered.
+    func setState(_ target: TaskFlow, _ newState: TaskFlow.State) {
+        target.state = newState
+        guard newState.isTerminal else {
+            return
+        }
+        for (_, waiter) in target.waiters {
+            waiter.resume()
+        }
+        target.waiters.removeAll()
+    }
+}
+
+// MARK: - Graph planning
+
+extension TaskFlowPool {
 
     /// Flattens the dependency graph into execution layers.
     ///
@@ -247,6 +461,11 @@ extension TaskFlowPool {
         _ = try collect(task)
         return groups.sorted { $0.key < $1.key }.map { $0.value }
     }
+}
+
+// MARK: - Retention and cancellation
+
+extension TaskFlowPool {
 
     /// Adds a node to the pool (once) and increments its retention count.
     ///
@@ -261,191 +480,6 @@ extension TaskFlowPool {
             node.pool = self
         }
         canonical.sinkCount += 1
-    }
-
-    /// Runs a single node, dispatching based on its current state.
-    func execute(_ node: TaskFlow) async throws {
-        let target = pool[node.id] ?? node
-        switch target.state {
-        case .ready:
-            await run(target)
-            try await resolveTerminal(target)
-        case .done(let timestamp):
-            if isExpired(target, timestamp: timestamp) {
-                await run(target)
-                try await resolveTerminal(target)
-            }
-        case .flowing:
-            // Another flow is already running this node; wait for it.
-            await waitForTerminal(target)
-            try await resolveTerminal(target)
-        case .error:
-            try await retry(target)
-        case .canceled:
-            throw TaskFlowError.canceled
-        }
-    }
-
-    /// Starts a single execution: marks the node flowing, invokes its handler,
-    /// then waits for the terminal state (optionally bounded by `executionTimeout`).
-    func run(_ target: TaskFlow) async {
-        setState(target, .flowing)
-        target.runID &+= 1
-        let box = TaskFlowCompletionBox(runID: target.runID)
-        target.handler { [weak self, weak target] error in
-            guard let self, let target else {
-                return
-            }
-            box.error = error
-            Task { await self.complete(target, box: box) }
-        }
-        if target.executionTimeout > 0 {
-            await waitForTerminal(target, timeout: target.executionTimeout)
-        } else {
-            await waitForTerminal(target)
-        }
-    }
-
-    /// Records the result of a run, ignoring completions that are no longer current.
-    fileprivate func complete(_ target: TaskFlow, box: TaskFlowCompletionBox) async {
-        guard box.runID == target.runID else {
-            return
-        }
-        switch target.state {
-        case .flowing:
-            if let error = box.error {
-                setState(target, .error(error: error))
-            } else {
-                setState(target, .done(timestamp: Date().timeIntervalSince1970))
-            }
-        default:
-            break
-        }
-    }
-
-    /// Re-runs a failed node up to `retryLimit` times, then surfaces the underlying error.
-    func retry(_ target: TaskFlow) async throws {
-        guard target.retryCount < target.retryLimit else {
-            if case .error(let error) = target.state {
-                throw error ?? TaskFlowError.unknown
-            }
-            throw TaskFlowError.unknown
-        }
-        target.retryCount += 1
-        setState(target, .ready)
-        await run(target)
-        try await resolveTerminal(target)
-    }
-
-    /// Returns whether a `.done` result is too old to be reused.
-    func isExpired(_ target: TaskFlow, timestamp: TimeInterval) -> Bool {
-        target.expiresAfter > 0 && Date().timeIntervalSince1970 - timestamp > target.expiresAfter
-    }
-
-    /// Suspends until the task reaches a terminal state (or returns immediately if it already has).
-    ///
-    /// Waiter registration happens on the pool actor (via `waitOnActor`), and only
-    /// the actor ever transitions `state` (via `setState`), so waiting never reads
-    /// or writes `state`/`waiters` from a non-isolated context.
-    ///
-    /// The waiter is cancellation-aware: if the awaiting task is canceled, its own
-    /// continuation is removed and resumed so it cannot strand a task group's
-    /// implicit await or leak a registration.
-    func waitForTerminal(_ target: TaskFlow) async {
-        guard !target.state.isTerminal else {
-            return
-        }
-        let token = UUID()
-        await withTaskCancellationHandler {
-            await self.waitOnActor(target, token: token)
-        } onCancel: {
-            Task { await self.cancelWaiter(target, token: token) }
-        }
-    }
-
-    /// Registers (or aborts) a waiter on the actor.
-    ///
-    /// Runs actor-isolated and atomically re-checks terminal state and the waiting
-    /// task's cancellation, so a waiter canceled before registration never strands.
-    /// The continuation is resumed exactly once: either by the terminal transition
-    /// (via `setState`) or by `cancelWaiter`.
-    private func waitOnActor(_ target: TaskFlow, token: UUID) async {
-        if target.state.isTerminal || Task.isCancelled {
-            return
-        }
-        await withCheckedContinuation(isolation: self) {
-            (continuation: CheckedContinuation<Void, Never>) in
-            target.waiters[token] = continuation
-        }
-    }
-
-    /// Removes and resumes the waiter registered under `token`, if any.
-    private func cancelWaiter(_ target: TaskFlow, token: UUID) async {
-        if let waiter = target.waiters.removeValue(forKey: token) {
-            waiter.resume()
-        }
-    }
-
-    /// Suspends until the task reaches a terminal state or the timeout elapses,
-    /// marking the task `.error(.timedOut)` if the timeout wins.
-    func waitForTerminal(_ target: TaskFlow, timeout: TimeInterval) async {
-        guard !target.state.isTerminal else {
-            return
-        }
-        // Race the terminal wait against a background timer. The timer marks the
-        // node `.error(.timedOut)` on the actor (resuming every waiter) instead of
-        // racing a task group, so a canceled waiter can never strand the group.
-        let timeoutTask = Task {
-            try? await Task.sleep(for: .seconds(timeout))
-            // Cancellation of the run (or its flow) is not a per-task timeout: once
-            // canceled, leave the terminal transition to `cancelGraph`/`cancel` so a
-            // timed-out flow cannot mark nodes `.error(.timedOut)` instead of `.canceled`.
-            guard !Task.isCancelled else {
-                return
-            }
-            await self.markTimedOut(target)
-        }
-        await waitForTerminal(target)
-        timeoutTask.cancel()
-    }
-
-    /// Marks a node `.error(.timedOut)` unless it already reached a terminal state.
-    private func markTimedOut(_ target: TaskFlow) async {
-        if !target.state.isTerminal {
-            setState(target, .error(error: TaskFlowError.timedOut))
-        }
-    }
-
-    /// Transitions a node to a new state, resuming every waiter when the state is terminal.
-    ///
-    /// This is the single write path for `state` and must only be called on the
-    /// pool actor. Non-terminal transitions leave waiters registered.
-    func setState(_ target: TaskFlow, _ newState: TaskFlow.State) {
-        target.state = newState
-        guard newState.isTerminal else {
-            return
-        }
-        for (_, waiter) in target.waiters {
-            waiter.resume()
-        }
-        target.waiters.removeAll()
-    }
-
-    /// Applies retry/expiration policy after a node reached a terminal state.
-    func resolveTerminal(_ target: TaskFlow) async throws {
-        switch target.state {
-        case .done(let timestamp):
-            if isExpired(target, timestamp: timestamp) {
-                await run(target)
-                try await resolveTerminal(target)
-            }
-        case .error:
-            try await retry(target)
-        case .canceled:
-            throw TaskFlowError.canceled
-        default:
-            break
-        }
     }
 
     /// Transitions a ready/flowing node to `.canceled`; terminal states are left untouched.
@@ -469,9 +503,10 @@ extension TaskFlowPool {
 
     /// Releases a task and its reachable graph from the pool.
     ///
-    /// Each node's `sinkCount` is decremented once; a shared node is only removed
-    /// (and canceled) when the count reaches zero, so other owners are unaffected.
-    /// A visited set makes the recursion safe on cyclic graphs.
+    /// Each node's `sinkCount` is decremented once per released ownership share; a
+    /// shared node is only removed (and canceled) when the count reaches zero, so
+    /// other owners are unaffected. A visited set makes the recursion safe on
+    /// cyclic graphs.
     ///
     /// A node is kept in the pool when it is executing or holds a still-protected
     /// `.done` result (see `shouldRetain`); its sink count still drops, but it is
@@ -483,39 +518,62 @@ extension TaskFlowPool {
     public func clear(_ task: TaskFlow, force: Bool = false) {
         let target = pool[task.id] ?? task
         var visited: Set<ObjectIdentifier> = []
-        clear(target, force: force, visited: &visited)
+        release(target, force: force, visited: &visited)
     }
 
-    private func clear(_ task: TaskFlow, force: Bool, visited: inout Set<ObjectIdentifier>) {
-        guard visited.insert(ObjectIdentifier(task)).inserted else {
+    /// Releases exactly one ownership share of `node` and every node reachable from it.
+    ///
+    /// The decrement and the walk into dependencies happen together while the node
+    /// still has owners, so a shared intermediate node cannot strand the dependencies
+    /// registered by the owners it still has. A node is only considered for removal
+    /// once its own count reaches zero; `visited` keeps cyclic graphs terminating.
+    private func release(_ node: TaskFlow, force: Bool, visited: inout Set<ObjectIdentifier>) {
+        guard visited.insert(ObjectIdentifier(node)).inserted else {
             return
         }
-        let wasOwned = task.sinkCount > 0
-        guard wasOwned || pool[task.id] === task else {
+        let registered = pool[node.id] === node
+        guard node.sinkCount > 0 || registered else {
             return
         }
-        if wasOwned {
-            task.sinkCount -= 1
-        }
-        if wasOwned, task.sinkCount > 0 {
-            return
-        }
-        // This call released the last reference (or the node was already retained):
-        // balance its dependencies so a protected node cannot orphan its subtree.
-        let justReleased = wasOwned && task.sinkCount == 0
-        if justReleased {
-            for dependency in task.dependencies {
-                clear(dependency, force: force, visited: &visited)
+        if node.sinkCount > 0 {
+            node.sinkCount -= 1
+            for dependency in node.dependencies {
+                release(dependency, force: force, visited: &visited)
             }
         }
-        let shouldRemove = justReleased || (force && pool[task.id] === task)
-        guard shouldRemove else {
+        guard registered, node.sinkCount == 0 else {
             return
         }
-        guard force || !shouldRetain(task) else {
+        guard force || !shouldRetain(node) else {
             return
         }
-        remove(task)
+        remove(node)
+    }
+
+    /// Releases exactly the ownership a failed flow acquired.
+    ///
+    /// Every node in `nodes` was registered once by that flow, so each is decremented
+    /// once here — no graph walk is involved, which keeps shared subgraphs balanced
+    /// even when several registered nodes share dependencies. Nodes the aborted flow
+    /// left running with no remaining owner are canceled, and nodes that end up
+    /// unowned and unprotected are removed.
+    private func releaseRegistered(_ nodes: [TaskFlow]) {
+        for node in nodes {
+            let target = pool[node.id] ?? node
+            if target.sinkCount > 0 {
+                target.sinkCount -= 1
+            }
+        }
+        for node in nodes {
+            let target = pool[node.id] ?? node
+            if target.sinkCount == 0, case .flowing = target.state {
+                cancel(target)
+            }
+        }
+        for node in nodes {
+            let target = pool[node.id] ?? node
+            removeIfUnownedAndUnretained(target)
+        }
     }
 
     private func remove(_ task: TaskFlow) {
@@ -548,7 +606,23 @@ extension TaskFlowPool {
             return false
         }
     }
+
+    /// Removes a registered node that has no owners left and nothing to retain.
+    ///
+    /// Used after a terminal transition (such as a node that was cleared while it
+    /// was still running) and while releasing an aborted flow.
+    private func removeIfUnownedAndUnretained(_ target: TaskFlow) {
+        guard target.sinkCount == 0, pool[target.id] === target else {
+            return
+        }
+        guard !shouldRetain(target) else {
+            return
+        }
+        remove(target)
+    }
 }
+
+// MARK: - Batch operations by id
 
 extension TaskFlowPool {
 
@@ -580,6 +654,3 @@ extension TaskFlowPool {
         }
     }
 }
-
-/// Process-wide default pool used when `flow(on:)` is called without a pool.
-let mainPool: TaskFlowPool = TaskFlowPool()

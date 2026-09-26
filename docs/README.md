@@ -16,6 +16,9 @@ Built on Swift Concurrency (actors, structured concurrency).
 - **Result expiration** — cached results are re-run after `expiresAfter`.
 - **Cancellation** — cancel a single task or an entire reachable graph.
 - **Cleanup** — `clear()` releases a task and its dependencies from the pool, keeping executing tasks and still-fresh cached results (unless `force: true`).
+- **Async handlers** — `TaskFlow(operation:)` wraps an `async throws` body as the task.
+- **Awaitable cleanup** — `cancelAndWait()`/`clearAndWait()` (and static `cancelAndWait(ids:)`/`clearAndWait(ids:)`) wait until the pool has processed the request.
+- **Shared default pool** — `TaskFlowPool.shared` backs `flow()` when no pool is passed.
 
 ## Requirements
 
@@ -114,10 +117,20 @@ let download = TaskFlow(id: "download") { completion in
 }
 ```
 
+You can also write the body directly as an `async` operation. It runs off the
+pool's actor, and thrown errors participate in retries like any other failure:
+
+```swift
+let download = TaskFlow(id: "download") {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    // process data
+}
+```
+
 > **Synchronous task bodies run on the pool's actor.** Keep them short — a
 > long-running or blocking synchronous body (the `{ ... }` convenience form) would
 > stall every flow sharing that pool. For real work, use the completion-based form
-> above, optionally with `executionTimeout`.
+> above (optionally with `executionTimeout`) or the `async` operation form.
 
 ### 4. Retry and timeout
 
@@ -128,6 +141,9 @@ let fragile = TaskFlow(id: "fragile") { completion in
 fragile.retryLimit = 3          // retry up to 3 times
 fragile.executionTimeout = 5    // abort a single run after 5 seconds
 ```
+
+The retry budget belongs to a run chain: every fresh run (including an expired
+re-run in a later flow) gets `retryLimit` retries again.
 
 ### 5. Whole-flow timeout
 
@@ -150,15 +166,20 @@ config.expiresAfter = 60 // cached for 1 minute, re-runs afterwards
 ### 7. Cancel and clear
 
 ```swift
-task.cancel()           // cancel this task on its pool (keeps it in the pool)
+task.cancel()            // cancel this task on its pool (keeps it in the pool)
 task.cancel(clear: true) // cancel and release it (and its dependencies) from the pool
-task.clear()            // release task + dependencies from the pool
-task.clear(force: true) // release even if the result is still protected
+task.clear()             // release task + dependencies from the pool
+task.clear(force: true)  // release even if the result is still protected
+
+await task.cancelAndWait() // async forms that wait for the pool to finish
+await task.clearAndWait(force: true)
 ```
 
 Clearing is protection-aware:
 
-- A task that is currently **executing** is never released.
+- A task that is currently **executing** is never released while it runs. If you
+  clear it while it runs, it is released as soon as its run reaches a terminal
+  state (unless the result is protected).
 - A **completed** task stays in the pool while its result is protected — either
   because `isClearProtected` is set, or because `expiresAfter` has not elapsed yet.
   Its sink count still drops to `0`, so the cached result can be reused by later flows.
@@ -195,6 +216,13 @@ TaskFlow.cancel(ids: ["A"]) {
 }
 ```
 
+Or await the outcome directly with the `…AndWait` variants:
+
+```swift
+await TaskFlow.cancelAndWait(ids: ["A"], on: pool, clear: true)
+await TaskFlow.clearAndWait(id: "B")
+```
+
 Unknown ids are ignored. As with the instance API, `cancel` only affects tasks
 that have not yet finished: a task that already completed (`.done`) is left
 untouched.
@@ -213,10 +241,10 @@ do {
 
 ## How it works
 
-- `TaskFlowPool` is an `actor` that owns the shared task registry and all state transitions.
+- `TaskFlowPool` is an `actor` that owns the shared task registry and all state transitions. `TaskFlowPool.shared` is the process-wide default pool.
 - `flow(_:)` validates the graph (`layers`), registers every node, then executes it layer by layer.
 - `layers` assigns each node the depth of its longest dependency chain and uses a DFS visiting-set to detect cycles.
-- The pool de-duplicates tasks by `id` and tracks a `sinkCount`, so a shared dependency is only torn down when its last owner is cleared.
+- Every flow registers one ownership share per reachable node and releases exactly one share per node when cleared, so a shared dependency is torn down only when its last owner is gone. A failed or timed-out flow releases only its own shares and never disturbs nodes that other flows still own.
 
 ## License
 
